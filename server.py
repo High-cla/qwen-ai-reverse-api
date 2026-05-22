@@ -137,6 +137,7 @@ async def startup_event():
 
 SUPPORTED_MODELS = [
     # 基础模型 - 自动模式
+    "qwen3.7-max",
     "qwen3.6-plus",
     "qwen3.5-plus",
     "qwen3.5-omni-plus",
@@ -158,6 +159,7 @@ SUPPORTED_MODELS = [
     "qwen3.6-max-preview",
     "qwen3.6-27b",
     # 快速模式
+    "qwen3.7-max-fast",
     "qwen3.6-plus-fast",
     "qwen3.5-plus-fast",
     "qwen3.5-flash-fast",
@@ -166,6 +168,7 @@ SUPPORTED_MODELS = [
     "qwen3.6-max-preview-fast",
     "qwen3.6-27b-fast",
     # 思考模式
+    "qwen3.7-max-think",
     "qwen3.6-plus-think",
     "qwen3.5-plus-think",
     "qwen3.5-flash-think",
