@@ -29,6 +29,7 @@ class QwenAiStreamHandler:
         self.tool_calls_sent = False
         self.auto_delete_chat = auto_delete_chat
         self.delete_chat_func = delete_chat_func
+        self._pre_emit_buffer = ''  # Buffer for multi-byte safe content emission
     
     def set_chat_id(self, chat_id: str):
         """Set chat ID"""
@@ -50,6 +51,45 @@ class QwenAiStreamHandler:
         if line.startswith('data: '):
             return line[6:]
         return None
+    
+    @staticmethod
+    def _find_safe_split(text: str, target_len: int) -> int:
+        """Find a safe split point in text near target_len.
+        
+        Prefers splitting at whitespace/word boundaries to avoid cutting
+        multi-byte UTF-8 characters (Chinese, emoji, etc.) at awkward positions.
+        Python 3 strings are Unicode code-point safe, but this ensures we also
+        avoid splitting grapheme clusters where possible.
+        
+        Args:
+            text: The text to find a split point in
+            target_len: The desired split position (character index)
+            
+        Returns:
+            int: A safe character index to split at
+        """
+        max_len = len(text)
+        if target_len >= max_len:
+            return max_len
+        if target_len <= 0:
+            return 0
+        
+        # Search backwards from target_len for a whitespace boundary
+        # (up to 50 chars back) to avoid cutting words
+        search_start = max(0, target_len - 50)
+        for i in range(target_len, search_start - 1, -1):
+            if i < max_len and text[i].isspace():
+                return i + 1  # Include the space in the left portion
+        
+        # Search forward from target_len for a whitespace boundary
+        # (up to 50 chars forward)
+        for i in range(target_len, min(max_len, target_len + 50)):
+            if text[i].isspace():
+                return i + 1  # Include the space in the left portion
+        
+        # Last resort: split at target_len (Python 3 strings are code-point safe,
+        # so this never cuts a multi-byte character in the middle)
+        return target_len
     
     def handle_stream(self, response) -> Generator[str, None, None]:
         """Handle streaming response - direct line parsing like Chat2API
@@ -182,19 +222,27 @@ class QwenAiStreamHandler:
                         
                         self.content += content
                         
-                        if content:
-                            content_chunk = {
-                                'id': self.response_id or self.chat_id,
-                                'model': self.model,
-                                'object': 'chat.completion.chunk',
-                                'choices': [{
-                                    'index': 0,
-                                    'delta': {'content': content},
-                                    'finish_reason': None,
-                                }],
-                                'created': self.created,
-                            }
-                            yield f'data: {json.dumps(content_chunk)}\n\n'
+                        # Buffer content for multi-byte-safe word-boundary emission
+                        combined = self._pre_emit_buffer + content
+                        if len(combined) > 200:
+                            split_at = self._find_safe_split(combined, max(100, len(combined) - 200))
+                            emit_content = combined[:split_at]
+                            self._pre_emit_buffer = combined[split_at:]
+                            if emit_content:
+                                content_chunk = {
+                                    'id': self.response_id or self.chat_id,
+                                    'model': self.model,
+                                    'object': 'chat.completion.chunk',
+                                    'choices': [{
+                                        'index': 0,
+                                        'delta': {'content': emit_content},
+                                        'finish_reason': None,
+                                    }],
+                                    'created': self.created,
+                                }
+                                yield f'data: {json.dumps(content_chunk)}\n\n'
+                        else:
+                            self._pre_emit_buffer = combined
                     
                     # Handle phase is None but has content
                     elif phase is None and content:
@@ -211,21 +259,48 @@ class QwenAiStreamHandler:
                         
                         self.content += content
                         
-                        content_chunk = {
-                            'id': self.response_id or self.chat_id,
-                            'model': self.model,
-                            'object': 'chat.completion.chunk',
-                            'choices': [{
-                                'index': 0,
-                                'delta': {'content': content},
-                                'finish_reason': None,
-                            }],
-                            'created': self.created,
-                        }
-                        yield f'data: {json.dumps(content_chunk)}\n\n'
+                        # Buffer content for multi-byte-safe word-boundary emission
+                        combined = self._pre_emit_buffer + content
+                        if len(combined) > 200:
+                            split_at = self._find_safe_split(combined, max(100, len(combined) - 200))
+                            emit_content = combined[:split_at]
+                            self._pre_emit_buffer = combined[split_at:]
+                            if emit_content:
+                                content_chunk = {
+                                    'id': self.response_id or self.chat_id,
+                                    'model': self.model,
+                                    'object': 'chat.completion.chunk',
+                                    'choices': [{
+                                        'index': 0,
+                                        'delta': {'content': emit_content},
+                                        'finish_reason': None,
+                                    }],
+                                    'created': self.created,
+                                }
+                                yield f'data: {json.dumps(content_chunk)}\n\n'
+                        else:
+                            self._pre_emit_buffer = combined
                     
                     # Handle finished status
                     if status == 'finished' and (phase == 'answer' or phase is None):
+                        # Flush any remaining buffered content
+                        if self._pre_emit_buffer:
+                            remaining = self._pre_emit_buffer.strip('\n')
+                            self._pre_emit_buffer = ''
+                            if remaining:
+                                content_chunk = {
+                                    'id': self.response_id or self.chat_id,
+                                    'model': self.model,
+                                    'object': 'chat.completion.chunk',
+                                    'choices': [{
+                                        'index': 0,
+                                        'delta': {'content': remaining},
+                                        'finish_reason': None,
+                                    }],
+                                    'created': self.created,
+                                }
+                                yield f'data: {json.dumps(content_chunk)}\n\n'
+                        
                         # Check for tool calls
                         if self._has_tool_use(self.content):
                             for chunk in self._generate_tool_calls():
@@ -253,6 +328,24 @@ class QwenAiStreamHandler:
             pass
         except Exception as e:
             print(f'[QwenAI] Stream error: {e}')
+        
+        # Flush any remaining buffered content before finishing
+        if self._pre_emit_buffer:
+            remaining = self._pre_emit_buffer.strip('\n')
+            self._pre_emit_buffer = ''
+            if remaining:
+                content_chunk = {
+                    'id': self.response_id or self.chat_id,
+                    'model': self.model,
+                    'object': 'chat.completion.chunk',
+                    'choices': [{
+                        'index': 0,
+                        'delta': {'content': remaining},
+                        'finish_reason': None,
+                    }],
+                    'created': self.created,
+                }
+                yield f'data: {json.dumps(content_chunk)}\n\n'
         
         # Send final chunk if stream ended unexpectedly
         if not self.tool_calls_sent:

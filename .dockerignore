@@ -1,0 +1,26 @@
+# Security: never copy .env into the image
+.env
+
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Git
+.git/
+.gitignore
+
+# Project-specific
+.sisyphus/
+.codenomad/
+
+# Documentation (not needed at runtime)
+*.md
+docs/
+
+# Config examples
+.env.example
+proxy_config.example.txt

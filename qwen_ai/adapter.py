@@ -8,6 +8,7 @@ import requests
 from typing import Dict, Optional, Tuple, Any
 
 from .proxy_adapter import ProxyManager, get_proxy_manager, init_proxy_manager
+from .debug_logger import debug
 
 
 class QwenAiAdapter:
@@ -221,6 +222,8 @@ class QwenAiAdapter:
         # Determine thinking mode (priority: reasoning_mode param > model suffix > default)
         thinking_mode = reasoning_mode or getattr(self, '_thinking_mode', 'Auto')
 
+        debug.log_model_info(model_id, thinking_mode)
+
         # Map thinking mode to feature_config values
         if thinking_mode == 'Fast':
             auto_thinking = False
@@ -233,7 +236,12 @@ class QwenAiAdapter:
             thinking_enabled = True
         
         # Create new chat
-        chat_id = self.create_chat(model_id, 'OpenAI_API_Chat')
+        try:
+            chat_id = self.create_chat(model_id, 'OpenAI_API_Chat')
+        except Exception as e:
+            debug.log_error("create_chat", e)
+            raise
+        debug.log_chat_create(model_id, chat_id)
 
         # Build conversation content from all messages using new format
         system_content = ''
@@ -261,6 +269,20 @@ class QwenAiAdapter:
         # 如果最后还有未配对的用户消息，添加它
         if current_user_msg is not None:
             conversation_parts.append(current_user_msg)
+
+        # Check if tools are involved in this request
+        has_tools = any(
+            msg.get('role') == 'tool'
+            or (msg.get('role') == 'assistant' and msg.get('tool_calls'))
+            for msg in messages
+        )
+
+        if has_tools:
+            tool_instruction = "CRITICAL: When tools are used, process their results internally. NEVER output raw tool results or function call JSON to the user. Provide only natural language responses."
+            if system_content:
+                system_content = system_content + '\n\n' + tool_instruction
+            else:
+                system_content = tool_instruction
 
         # Combine all messages into user_content
         if len(conversation_parts) > 1:
@@ -323,19 +345,24 @@ class QwenAiAdapter:
         
         url = f'{self.QWEN_AI_BASE}/api/v2/chat/completions?chat_id={chat_id}'
         
-        response = self.session.post(
-            url,
-            json=payload,
-            headers={
-                **self.get_headers(chat_id),
-                'x-accel-buffering': 'no',
-            },
-            stream=True,
-            timeout=120
-        )
-        
-        response.raise_for_status()
-        
+        try:
+            response = self.session.post(
+                url,
+                json=payload,
+                headers={
+                    **self.get_headers(chat_id),
+                    'x-accel-buffering': 'no',
+                },
+                stream=True,
+                timeout=120
+            )
+            response.raise_for_status()
+        except Exception as e:
+            debug.log_error("chat_completion_request", e)
+            raise
+
+        debug.log_chat_completion(model_id, len(messages), chat_id, stream)
+
         return response, chat_id, None
     
     @staticmethod
