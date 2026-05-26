@@ -34,6 +34,29 @@ class ChatCompletionRequest(BaseModel):
         extra = "allow"
 
 
+class ResponsesRequest(BaseModel):
+    """OpenAI Responses API request format (used by latest SDKs)"""
+    model: str
+    input: Any  # str or List[Dict]
+    stream: bool = False
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    top_p: Optional[float] = None
+    tools: Optional[List[Dict]] = None
+
+    class Config:
+        extra = "allow"
+
+
+class ResponsesResponse(BaseModel):
+    """Minimal OpenAI Responses API response"""
+    id: str = ""
+    object: str = "response"
+    created: int = 0
+    model: str = ""
+    output: List[Dict] = []
+
+
 # Global settings from environment
 AUTO_DELETE_CHAT = os.environ.get('AUTO_DELETE_CHAT', 'false').lower() == 'true'
 
@@ -186,6 +209,16 @@ async def list_models():
     return ModelsResponse(data=models)
 
 
+@app.get("/v1/models/{model_id:path}")
+async def get_model(model_id: str):
+    """Get a specific model by ID (OpenAI SDK compatibility)"""
+    # Strip provider prefix if present (e.g. "openai/qwen3.6-plus" -> "qwen3.6-plus")
+    clean_id = model_id.split("/")[-1] if "/" in model_id else model_id
+    if clean_id in SUPPORTED_MODELS:
+        return ModelInfo(id=model_id)
+    raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+
 def select_random_token(token_string: str) -> str:
     """Select a random token from comma-separated list"""
     tokens = [t.strip() for t in token_string.split(',') if t.strip()]
@@ -199,7 +232,12 @@ async def chat_completions(
     request: ChatCompletionRequest,
     authorization: Optional[str] = Header(None)
 ):
-    """Chat completions endpoint with context support and token rotation"""
+    # Strip provider prefix from model name (e.g. "openai/qwen3.6-plus" -> "qwen3.6-plus")
+    if "/" in request.model:
+        original = request.model
+        request.model = request.model.split("/", 1)[1]
+        print(f"[Server] Normalized model: {original} -> {request.model}")
+
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
@@ -237,6 +275,130 @@ async def chat_completions(
             )
         else:
             return await openai_non_stream(client, request.model, request.messages, request.temperature, existing_chat_id, AUTO_DELETE_CHAT, reasoning_mode)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/responses")
+async def responses_completions(
+    request: ResponsesRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """OpenAI Responses API endpoint — adapts to Chat Completions, returns Responses format"""
+    # Debug: log incoming request
+    print(f"[Responses] Model: {request.model}, Input type: {type(request.input).__name__}, Stream: {request.stream}", flush=True)
+    if isinstance(request.input, list):
+        print(f"[Responses] Input sample: {str(request.input)[:200]}", flush=True)
+
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    if authorization.startswith("Bearer "):
+        jwt_token = authorization[7:]
+    else:
+        jwt_token = authorization
+    if not jwt_token:
+        raise HTTPException(status_code=401, detail="Invalid Authorization header format")
+
+    # Handle different input formats (string, simple messages, Responses API messages)
+    raw = request.input
+    if isinstance(raw, str):
+        messages = [{"role": "user", "content": raw}]
+    elif isinstance(raw, list):
+        messages = []
+        for item in raw:
+            if isinstance(item, dict):
+                # Responses API format: {"role":"user","content":[{"type":"input_text","text":"hi"}]}
+                role = item.get("role", "user")
+                content = item.get("content", "")
+                # Flatten complex content arrays
+                if isinstance(content, list):
+                    texts = []
+                    for c in content:
+                        if isinstance(c, dict):
+                            texts.append(c.get("text", c.get("content", str(c))))
+                        else:
+                            texts.append(str(c))
+                    content = " ".join(texts)
+                messages.append({"role": role, "content": content})
+            else:
+                messages.append({"role": "user", "content": str(item)})
+    else:
+        raise HTTPException(status_code=400, detail="Invalid input format")
+
+    # Force non-streaming to get a simple response
+    try:
+        client = QwenAiClient(token=jwt_token)
+        # Normalize model name (strip provider prefix)
+        model_name = request.model.split("/", 1)[1] if "/" in request.model else request.model
+
+        # Only handle supported Qwen models; reject others with polite error
+        if model_name not in SUPPORTED_MODELS:
+            raise HTTPException(status_code=400,
+                detail=f"Model '{model_name}' not supported by Qwen API")
+
+        response, chat_id, _ = client.adapter.chat_completion(
+            model=model_name,
+            messages=messages,
+            stream=True,  # always stream internally to collect full content
+            temperature=request.temperature,
+            auto_delete_chat=AUTO_DELETE_CHAT,
+        )
+
+        content_text = ""
+        for line in response.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8")
+            if not line_str.startswith("data: "):
+                continue
+            data_str = line_str[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+                if data.get("choices"):
+                    delta = data["choices"][0].get("delta", {})
+                    phase = delta.get("phase")
+                    if phase == "answer" or phase is None:
+                        content_text += delta.get("content", "")
+            except:
+                pass
+
+        # Handle auto delete
+        if AUTO_DELETE_CHAT and chat_id:
+            try:
+                client.adapter.delete_chat(chat_id)
+            except:
+                pass
+
+        # Build Responses API response (matching official OpenAI format)
+        resp_id = f"resp_{int(time.time())}"
+        created_ts = int(time.time())
+
+        return JSONResponse(content={
+            "id": resp_id,
+            "object": "response",
+            "created_at": created_ts,
+            "model": model_name,
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": f"msg_{int(time.time())}",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": content_text,
+                    "annotations": []
+                }]
+            }],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2
+            }
+        })
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
