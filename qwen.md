@@ -199,6 +199,72 @@ cd /d "%~dp0"
 .\venv\Scripts\python.exe start_server.py
 ```
 
+### 6. Docker Deployment
+
+A `Dockerfile` based on `python:3.14-slim` is provided for containerized deployment:
+
+```dockerfile
+FROM python:3.14-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["python", "start_server.py"]
+```
+
+Build and run:
+
+```bash
+docker build -t qwen-ai-reverse-api .
+docker run -d --name qwen-api -p 8000:8000 \
+  -e QWEN_TOKENS="jwt1,jwt2" \
+  -e DEBUG_LOG_LEVEL="1" \
+  qwen-ai-reverse-api
+```
+
+### 7. Debug Logging System
+
+Controlled by the `DEBUG_LOG_LEVEL` environment variable, the debug logger prints structured logs to stdout with a `[Debug]` prefix:
+
+| Level | Value | Output |
+|-------|-------|--------|
+| Off | `0` | No debug output (default) |
+| Basic | `1` | Chat creation, model info, errors, tool calls |
+| Verbose | `2` | Plus stream phase transitions, request details |
+
+Enable it:
+
+```bash
+# .env
+DEBUG_LOG_LEVEL=1
+
+# or inline
+DEBUG_LOG_LEVEL=2 python start_server.py
+```
+
+Sample verbose output:
+
+```
+[Debug] Chat created  model=qwen3.6-plus  chat_id=abc123  (320ms)
+[Debug] Chat completion  model=qwen3.6-plus  messages=3  chat_id=abc123  mode=stream
+[Debug] Stream phase=think  chat_id=abc123
+[Debug] Stream phase=answer  chat_id=abc123
+[Debug] Tool call  name=image_generation  chat_id=abc123  args={"prompt":"..."}
+```
+
+### 8. Tool Output Filtering
+
+When tools are used in a conversation, the adapter automatically injects a system instruction telling the model to process tool results internally and return only natural language responses — no raw JSON or function call output leaks to the user.
+
+### 9. Stream UTF-8 Word-Boundary Safety
+
+Streaming output uses a buffering strategy with `_find_safe_split()` that avoids cutting multi-byte characters (Chinese, emoji, etc.) at awkward positions. Instead of emitting every tiny content delta immediately, content is accumulated into a buffer and split at whitespace/word boundaries, ensuring clean, readable output in every chunk.
+
+### 10. Relaxed Dependencies
+
+`requirements.txt` uses `>=` version pins instead of exact versions, ensuring compatibility across Python 3.8 through 3.14+ without conflicts.
+
 ---
 
 ## API Endpoints
@@ -338,6 +404,52 @@ cp .env.example .env
 python start_server.py --port 8000
 ```
 
+### Docker Deployment
+
+```bash
+# 1. Build the image
+docker build -t qwen-ai-reverse-api .
+
+# 2. Run the container
+docker run -d \
+  --name qwen-api \
+  -p 8000:8000 \
+  -e QWEN_TOKENS="your-jwt-token" \
+  -e DEBUG_LOG_LEVEL="1" \
+  -e AUTO_DELETE_CHAT="false" \
+  qwen-ai-reverse-api
+
+# 3. Verify
+curl http://localhost:8000/v1/models
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer your-jwt-token" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-plus","messages":[{"role":"user","content":"Hello"}]}'
+
+# Stop & clean up
+docker stop qwen-api && docker rm qwen-api
+```
+
+**Docker Compose** (create `docker-compose.yml`):
+
+```yaml
+version: "3.9"
+services:
+  qwen-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - QWEN_TOKENS=your-jwt-token
+      - DEBUG_LOG_LEVEL=1
+      - AUTO_DELETE_CHAT=false
+    restart: unless-stopped
+```
+
+```bash
+docker compose up -d
+```
+
 ### Server Options
 
 | Flag | Default | Description |
@@ -364,27 +476,37 @@ curl http://localhost:8000/v1/models/qwen3.6-plus
 
 This fork was designed to be used as an OpenAI-compatible provider in **OpenCode** and similar AI CLI tools.
 
-### Method 1: Direct Configuration
+### Method 1: Direct OpenCode Configuration
 
-Configure OpenCode to use your local Qwen API as an OpenAI-compatible provider:
+Configure OpenCode's `opencode.json` to use your local Qwen API as an OpenAI-compatible provider:
 
 ```json
-// opencode.json or provider config
 {
-  "name": "qwen-local",
-  "apiKey": "your-jwt-token",
-  "baseUrl": "http://localhost:8000/v1",
-  "models": {
-    "default": ["qwen3.6-plus"],
-    "fetch": true   // auto-discovers models via GET /v1/models
+  "providers": {
+    "qwen": {
+      "name": "qwen-local",
+      "apiKey": "your-jwt-token",
+      "baseUrl": "http://localhost:8000/v1",
+      "models": {
+        "default": ["qwen3.6-plus"],
+        "fetch": true
+      }
+    }
+  },
+  "model": {
+    "default": "qwen/qwen3.6-plus"
   }
 }
 ```
 
-The `GET /v1/models` endpoint returns the full list of supported models, enabling auto-discovery.
+**Key points:**
+- `"fetch": true` auto-discovers all supported models via `GET /v1/models`
+- Provider prefix `qwen/` is optional — the server strips it if present
+- Multiple models can be specified in `"default": ["qwen3.6-plus", "qwen3.5-flash"]`
 
-### Method 2: OpenAI SDK
+### Method 2: OpenAI-Compatible Client (Any Language)
 
+**Python (OpenAI SDK):**
 ```python
 from openai import OpenAI
 
@@ -404,11 +526,64 @@ response = client.responses.create(
     model="qwen3.6-plus",
     input="Hello"
 )
+
+# Streaming
+stream = client.chat.completions.create(
+    model="qwen3.6-plus",
+    messages=[{"role": "user", "content": "Tell me a story"}],
+    stream=True
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="")
+```
+
+**JavaScript (OpenAI SDK):**
+```javascript
+import OpenAI from 'openai';
+
+const client = new OpenAI({
+  baseURL: 'http://localhost:8000/v1',
+  apiKey: 'your-jwt-token'
+});
+
+const response = await client.chat.completions.create({
+  model: 'qwen3.6-plus',
+  messages: [{ role: 'user', content: 'Hello' }]
+});
+```
+
+**cURL:**
+```bash
+# Non-streaming
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer your-jwt-token" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-plus","messages":[{"role":"user","content":"Hello"}]}'
+
+# Streaming
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer your-jwt-token" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-plus","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Responses API
+curl -X POST http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer your-jwt-token" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-plus","input":"Hello"}'
 ```
 
 ### Method 3: Provider Prefix Compatibility
 
 When tools send `openai/qwen3.6-plus` as the model name, the prefix is automatically stripped. No client-side modification needed.
+
+| Model sent by client | Normalized to | Works? |
+|---------------------|---------------|--------|
+| `qwen3.6-plus` | `qwen3.6-plus` | ✅ |
+| `openai/qwen3.6-plus` | `qwen3.6-plus` | ✅ |
+| `qwen/qwen3.6-plus` | `qwen3.6-plus` | ✅ |
+| `qwen3.5-flash` | `qwen3.5-flash` | ✅ |
 
 ---
 
@@ -417,23 +592,26 @@ When tools send `openai/qwen3.6-plus` as the model name, the prefix is automatic
 ### `.env` File
 
 ```bash
-# Required
+# ── Required ──────────────────────────────────────────
 QWEN_TOKENS="jwt1,jwt2,jwt3"     # Comma-separated JWT tokens
 
-# Optional: Auto-delete chat records
-AUTO_DELETE_CHAT=false
+# ── Debug Logging ─────────────────────────────────────
+DEBUG_LOG_LEVEL=0                 # 0=off, 1=basic, 2=verbose
 
-# Optional: Proxy
+# ── Chat Management ───────────────────────────────────
+AUTO_DELETE_CHAT=false            # Auto-delete chat records after use
+
+# ── Proxy Pool (Vless) ────────────────────────────────
 ENABLE_PROXY=false
-VLESS_SUBSCRIPTION_URLS=""
-VLESS_SUBSCRIPTION_PATTERNS="CF优选-电信"
-VLESS_AUTO_REFRESH_ON_START=true
+VLESS_SUBSCRIPTION_URLS=""        # Comma-separated subscription URLs
+VLESS_SUBSCRIPTION_PATTERNS="CF优选-电信"  # Node name filter patterns
+VLESS_AUTO_REFRESH_ON_START=true  # Refresh subscriptions on startup
 
-# Optional: Network
+# ── Network ───────────────────────────────────────────
 HOST="0.0.0.0"
 PORT="8000"
-HTTP_PROXY=""
-HTTPS_PROXY=""
+HTTP_PROXY=""                     # Traditional HTTP proxy
+HTTPS_PROXY=""                    # Traditional HTTPS proxy
 ```
 
 ### Token Rotation

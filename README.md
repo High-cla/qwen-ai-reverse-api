@@ -18,8 +18,13 @@
 - **OpenAI Responses API 兼容** — 新增 `POST /v1/responses` 端点，支持 OpenAI 新版 Responses API 格式，自动将 `input` 字段转换为 `messages` 数组，并返回 `created_at`、`status`、`usage` 等标准字段
 - **模型验证端点** — 新增 `GET /v1/models/{model_id}` 端点，支持 SDK 模型验证，可返回任意 Qwen 模型信息（含或不含 provider 前缀）
 - **模型名前缀自动剥离** — 在 `/v1/chat/completions` 和 `/v1/responses` 中自动去除 `openai/` 等 provider 前缀，提高兼容性（如 `openai/qwen3.6-plus` → `qwen3.6-plus`）
-- **更新启动脚本** — `start-all.cmd` 改为使用 venv Python 3.14，修复 CRLF 换行问题
+- **Docker 部署支持** — 新增 Dockerfile，基于 Python 3.14-slim 镜像，支持单命令容器化部署
+- **调试日志系统** — 新增 `DEBUG_LOG_LEVEL` 环境变量，支持三级日志（0=关闭, 1=基础, 2=详细），便于排查 API 调用和流处理问题
+- **工具输出过滤** — 自动注入系统指令过滤工具调用的原始输出，确保返回纯净的自然语言响应
+- **流式 UTF-8 安全切片** — 改进流式输出的分片策略，避免在中文、emoji 等多字节字符中间截断，优先在词边界分割
+- **更新启动脚本** — `start-all.cmd` 改为使用 venv Python 3.14，修复 CRLF 换行问题，支持动态路径
 - **不支持的模型处理** — 对不在 `SUPPORTED_MODELS` 中的模型返回 HTTP 400 错误，替代原来的空白响应
+- **依赖版本宽松化** — 降低 requirements.txt 版本限制，提升跨 Python 版本兼容性
 
 ## ✨ 功能特性
 
@@ -45,6 +50,33 @@
 ```bash
 pip install -r requirements.txt
 ```
+
+### Docker 部署
+
+本项目提供 Dockerfile，支持容器化部署：
+
+```bash
+# 构建镜像
+docker build -t qwen-ai-reverse-api .
+
+# 运行容器（替换为你的 JWT Token）
+docker run -d \
+  --name qwen-api \
+  -p 8000:8000 \
+  -e QWEN_TOKENS="your-jwt-token" \
+  qwen-ai-reverse-api
+
+# 查看日志
+docker logs -f qwen-api
+```
+
+**Docker 环境变量：**
+| 变量 | 说明 |
+|------|------|
+| `QWEN_TOKENS` | JWT Token（必填，逗号分隔多个） |
+| `DEBUG_LOG_LEVEL` | 调试日志级别：0/1/2 |
+| `AUTO_DELETE_CHAT` | 是否自动删除对话 |
+| `ENABLE_PROXY` | 是否启用代理池 |
 
 ## 🚀 快速开始
 
