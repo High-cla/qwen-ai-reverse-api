@@ -9,6 +9,17 @@
 ## 🔗 相关项目
 
 - [DeepSeek Reverse API](https://github.com/Wu-jiyan/deepseek-reverse-api) - DeepSeek 网页端 逆向 API
+- [Original Qwen Reverse API](https://github.com/Wu-jiyan/qwen-ai-reverse-api) - 上游原始项目
+
+## 🔄 Fork 改进 / Fork Improvements
+
+本分支在上游原始项目基础上进行了以下改进：
+
+- **OpenAI Responses API 兼容** — 新增 `POST /v1/responses` 端点，支持 OpenAI 新版 Responses API 格式，自动将 `input` 字段转换为 `messages` 数组，并返回 `created_at`、`status`、`usage` 等标准字段
+- **模型验证端点** — 新增 `GET /v1/models/{model_id}` 端点，支持 SDK 模型验证，可返回任意 Qwen 模型信息（含或不含 provider 前缀）
+- **模型名前缀自动剥离** — 在 `/v1/chat/completions` 和 `/v1/responses` 中自动去除 `openai/` 等 provider 前缀，提高兼容性（如 `openai/qwen3.6-plus` → `qwen3.6-plus`）
+- **更新启动脚本** — `start-all.cmd` 改为使用 venv Python 3.14，修复 CRLF 换行问题
+- **不支持的模型处理** — 对不在 `SUPPORTED_MODELS` 中的模型返回 HTTP 400 错误，替代原来的空白响应
 
 ## ✨ 功能特性
 
