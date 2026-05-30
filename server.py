@@ -367,47 +367,23 @@ async def responses_completions(
             sse_count += 1
             try:
                 data = json.loads(data_str)
-
-                # Try new Responses API event format first (response.output_text.delta)
-                if data.get("type") == "response.output_text.delta":
-                    delta_text = data.get("delta", "")
-                    content_text += delta_text
-                    answer_detected = True
-                    continue
-
-                # Fall back to legacy chat/completions format with choices
                 if data.get("choices"):
                     delta = data["choices"][0].get("delta", {})
                     phase = delta.get("phase")
                     content = delta.get("content", "")
-                    extra = delta.get("extra", {})
-                    if sse_count <= 3:
-                        print(f"[SSE Debug] phase={phase}, content_len={len(content)}, has_choices=True", flush=True)
                     if phase == "answer" or phase is None:
                         content_text += content
                         answer_detected = True
                     elif phase == "thinking_summary":
-                        summary_thought = extra.get("summary_thought", {})
-                        sc = summary_thought.get("content")
-                        if sc:
-                            if isinstance(sc, list):
-                                thinking_fallback = "\n".join(sc)
-                            else:
-                                thinking_fallback = str(sc)
-                elif sse_count <= 3:
-                    print(f"[SSE Debug] no choices key, data keys={list(data.keys())}", flush=True)
+                        summary_thought = delta.get("extra", {}).get("summary_thought", {})
+                        if summary_thought.get("content"):
+                            thinking_fallback = "\n".join(summary_thought["content"])
             except json.JSONDecodeError:
-                if sse_count <= 3:
-                    print(f"[SSE Debug] JSON parse error for: {data_str[:100]}", flush=True)
-            except Exception:
-                if sse_count <= 3:
-                    print(f"[SSE Debug] parse error for: {data_str[:200]}", flush=True)
+                pass
 
         # Use thinking_summary as fallback for models that return all content in thinking phase
         if not content_text and thinking_fallback:
             content_text = thinking_fallback
-
-        print(f"[SSE Debug] total_events={sse_count}, content_text_len={len(content_text)}, answer_detected={answer_detected}, content_text_start={content_text[:200]!r}", flush=True)
 
         if not content_text:
             raise HTTPException(status_code=502,
