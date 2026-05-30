@@ -238,6 +238,10 @@ async def chat_completions(
         request.model = request.model.split("/", 1)[1]
         print(f"[Server] Normalized model: {original} -> {request.model}")
 
+    # Reject unsupported models with clear error instead of blank response
+    if request.model not in SUPPORTED_MODELS:
+        raise HTTPException(status_code=400, detail=f"Model '{request.model}' not supported by Qwen API")
+
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
@@ -276,6 +280,8 @@ async def chat_completions(
         else:
             return await openai_non_stream(client, request.model, request.messages, request.temperature, existing_chat_id, AUTO_DELETE_CHAT, reasoning_mode)
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -346,6 +352,9 @@ async def responses_completions(
         )
 
         content_text = ""
+        thinking_fallback = ""
+        answer_detected = False
+        sse_count = 0
         for line in response.iter_lines():
             if not line:
                 continue
@@ -355,15 +364,54 @@ async def responses_completions(
             data_str = line_str[6:]
             if data_str == "[DONE]":
                 break
+            sse_count += 1
             try:
                 data = json.loads(data_str)
+
+                # Try new Responses API event format first (response.output_text.delta)
+                if data.get("type") == "response.output_text.delta":
+                    delta_text = data.get("delta", "")
+                    content_text += delta_text
+                    answer_detected = True
+                    continue
+
+                # Fall back to legacy chat/completions format with choices
                 if data.get("choices"):
                     delta = data["choices"][0].get("delta", {})
                     phase = delta.get("phase")
+                    content = delta.get("content", "")
+                    extra = delta.get("extra", {})
+                    if sse_count <= 3:
+                        print(f"[SSE Debug] phase={phase}, content_len={len(content)}, has_choices=True", flush=True)
                     if phase == "answer" or phase is None:
-                        content_text += delta.get("content", "")
-            except:
-                pass
+                        content_text += content
+                        answer_detected = True
+                    elif phase == "thinking_summary":
+                        summary_thought = extra.get("summary_thought", {})
+                        sc = summary_thought.get("content")
+                        if sc:
+                            if isinstance(sc, list):
+                                thinking_fallback = "\n".join(sc)
+                            else:
+                                thinking_fallback = str(sc)
+                elif sse_count <= 3:
+                    print(f"[SSE Debug] no choices key, data keys={list(data.keys())}", flush=True)
+            except json.JSONDecodeError:
+                if sse_count <= 3:
+                    print(f"[SSE Debug] JSON parse error for: {data_str[:100]}", flush=True)
+            except Exception:
+                if sse_count <= 3:
+                    print(f"[SSE Debug] parse error for: {data_str[:200]}", flush=True)
+
+        # Use thinking_summary as fallback for models that return all content in thinking phase
+        if not content_text and thinking_fallback:
+            content_text = thinking_fallback
+
+        print(f"[SSE Debug] total_events={sse_count}, content_text_len={len(content_text)}, answer_detected={answer_detected}, content_text_start={content_text[:200]!r}", flush=True)
+
+        if not content_text:
+            raise HTTPException(status_code=502,
+                detail="Qwen API returned empty response in /v1/responses")
 
         # Handle auto delete
         if AUTO_DELETE_CHAT and chat_id:
@@ -382,6 +430,7 @@ async def responses_completions(
             "created_at": created_ts,
             "model": model_name,
             "status": "completed",
+            "output_text": content_text,
             "output": [{
                 "type": "message",
                 "id": f"msg_{int(time.time())}",
@@ -400,6 +449,8 @@ async def responses_completions(
             }
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -434,8 +485,11 @@ async def openai_non_stream(client, model, messages, temperature, existing_chat_
 
         content = ''
         reasoning = ''
+        thinking_fallback = ''
         response_id = ''
         created = int(time.time())
+        sse_count = 0
+        answer_detected = False
 
         for line in response.iter_lines():
             if not line:
@@ -448,6 +502,7 @@ async def openai_non_stream(client, model, messages, temperature, existing_chat_
             if data_str == '[DONE]':
                 break
 
+            sse_count += 1
             try:
                 data = json.loads(data_str)
                 if data.get('response.created', {}).get('response_id'):
@@ -458,13 +513,42 @@ async def openai_non_stream(client, model, messages, temperature, existing_chat_
                     phase = delta.get('phase')
                     status = delta.get('status')
                     text = delta.get('content', '')
+                    extra = delta.get('extra', {})
+
+                    if sse_count <= 3:
+                        print(f"[SSE Chat Debug] phase={phase}, status={status}, content_len={len(text)}, has_choices=True", flush=True)
 
                     if phase == 'think' and status != 'finished':
                         reasoning += text
+                    elif phase == 'thinking_summary':
+                        summary_thought = extra.get('summary_thought', {})
+                        if summary_thought.get('content'):
+                            thinking_text = '\n'.join(summary_thought['content'])
+                            reasoning += thinking_text
+                            # Store latest thinking summary as content fallback
+                            thinking_fallback = thinking_text
                     elif phase == 'answer' or phase is None:
                         content += text
-            except:
-                pass
+                        answer_detected = True
+                else:
+                    if sse_count <= 3:
+                        print(f"[SSE Chat Debug] no choices key, data keys={list(data.keys())}", flush=True)
+            except json.JSONDecodeError:
+                if sse_count <= 3:
+                    print(f"[SSE Chat Debug] JSON parse error for: {data_str[:100]}", flush=True)
+
+        # Use thinking_summary as content fallback for models that only return thinking_summary
+        if not content and thinking_fallback:
+            content = thinking_fallback
+
+        print(f"[SSE Chat Debug] total_events={sse_count}, content_len={len(content)}, reasoning_len={len(reasoning)}, answer_detected={answer_detected}", flush=True)
+
+        # Raise error if response is empty — don't return 200 OK with blank content
+        if not content and not reasoning:
+            raise ValueError(
+                "Empty response from Qwen API — model may be unsupported, "
+                "returned a non-SSE error body, or the SSO token is invalid/expired"
+            )
 
         # Handle auto delete or session save
         if auto_delete_chat and chat_created and chat_id:
@@ -509,6 +593,7 @@ def openai_stream(client, model, messages, temperature, existing_chat_id=None,
     chat_id = existing_chat_id
     created = int(time.time())
     full_content = ''
+    thinking_fallback = ''
     reasoning_content = ''
     has_sent_role = False
     chat_created = False
@@ -606,6 +691,8 @@ def openai_stream(client, model, messages, temperature, existing_chat_id=None,
                                 'reasoning_content': thinking_text
                             }
                             yield f'data: {json.dumps(openai_chunk)}\n\n'
+                        # Store latest thinking summary as content fallback (each event has FULL text)
+                        thinking_fallback = thinking_text
                     
                     # Send finish for thinking phase
                     if status == 'finished':
@@ -704,6 +791,36 @@ def openai_stream(client, model, messages, temperature, existing_chat_id=None,
                     
             except json.JSONDecodeError:
                 continue
+        
+        # Use thinking_summary as content fallback if no answer phase was detected
+        if not full_content and thinking_fallback:
+            full_content = thinking_fallback
+            fallback_chunk = {
+                'id': response_id or '',
+                'object': 'chat.completion.chunk',
+                'created': created,
+                'model': model,
+                'chat_id': chat_id,
+                'choices': [{
+                    'index': 0,
+                    'delta': {'content': thinking_fallback},
+                    'finish_reason': None
+                }]
+            }
+            yield f'data: {json.dumps(fallback_chunk)}\n\n'
+            fallback_chunk['choices'][0]['delta'] = {}
+            fallback_chunk['choices'][0]['finish_reason'] = 'stop'
+            yield f'data: {json.dumps(fallback_chunk)}\n\n'
+            yield 'data: [DONE]\n\n'
+            # Save session for context
+            if auto_delete_chat and chat_created and chat_id:
+                try:
+                    client.adapter.delete_chat(chat_id)
+                    print(f'[Server] Auto-deleted chat: {chat_id}')
+                except Exception as e:
+                    print(f'[Server] Failed to auto-delete chat {chat_id}: {e}')
+            else:
+                session_manager.set(chat_id, model, messages + [{'role': 'assistant', 'content': full_content}])
         
     except Exception as e:
         error = {'error': {'message': str(e), 'type': 'internal_error'}}
