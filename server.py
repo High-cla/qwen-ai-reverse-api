@@ -292,10 +292,6 @@ async def responses_completions(
     authorization: Optional[str] = Header(None)
 ):
     """OpenAI Responses API endpoint — adapts to Chat Completions, returns Responses format"""
-    # Debug: log incoming request
-    print(f"[Responses] Model: {request.model}, Input type: {type(request.input).__name__}, Stream: {request.stream}", flush=True)
-    if isinstance(request.input, list):
-        print(f"[Responses] Input sample: {str(request.input)[:200]}", flush=True)
 
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -352,9 +348,6 @@ async def responses_completions(
         )
 
         content_text = ""
-        thinking_fallback = ""
-        answer_detected = False
-        sse_count = 0
         for line in response.iter_lines():
             if not line:
                 continue
@@ -364,26 +357,15 @@ async def responses_completions(
             data_str = line_str[6:]
             if data_str == "[DONE]":
                 break
-            sse_count += 1
             try:
                 data = json.loads(data_str)
                 if data.get("choices"):
                     delta = data["choices"][0].get("delta", {})
                     phase = delta.get("phase")
-                    content = delta.get("content", "")
                     if phase == "answer" or phase is None:
-                        content_text += content
-                        answer_detected = True
-                    elif phase == "thinking_summary":
-                        summary_thought = delta.get("extra", {}).get("summary_thought", {})
-                        if summary_thought.get("content"):
-                            thinking_fallback = "\n".join(summary_thought["content"])
-            except json.JSONDecodeError:
+                        content_text += delta.get("content", "")
+            except:
                 pass
-
-        # Use thinking_summary as fallback for models that return all content in thinking phase
-        if not content_text and thinking_fallback:
-            content_text = thinking_fallback
 
         if not content_text:
             raise HTTPException(status_code=502,
